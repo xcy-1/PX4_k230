@@ -1,9 +1,11 @@
 {
     "python.analysis.extraPaths": [
         "E:/Miniconda3/Lib/site-packages/k230_full_stubs"
+        //将路径改为自己的文件路径
     ],
     "python.autoComplete.extraPaths": [
         "E:/Miniconda3/Lib/site-packages/k230_full_stubs"
+         //将路径改为自己的文件路径
     ],
     // 关闭严格类型检查，防止 stubs 之间有轻微冲突导致满屏红线
     "python.analysis.typeCheckingMode": "off",
