@@ -7,6 +7,10 @@ from media.sensor import *
 from media.media import *
 from machine import Pin
 
+
+from media.display import Display
+
+
 # --- 用户配置 ---
 WIFI_SSID = "1234"           
 WIFI_PASS = "12345789"       

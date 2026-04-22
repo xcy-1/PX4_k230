@@ -12,19 +12,76 @@ import ulab.numpy as np
 import image
 import random
 import gc
-import ustruct             # [新增] 用于打包二进制数据
+import ustruct             # 用于打包二进制数据
 from machine import UART
 from machine import FPIOA
+
 # ================= 用户配置区域 =================
 WIFI_SSID = "1234"
 WIFI_PASS = "12345789"
-PORT = 80
+PORT = 8080
 DEFAULT_SAVE_PATH = "/sdcard/images/"
 
-# 串口3 配置 (请核对原理图，通常 K230 CanMV 是 IO11/12)
 UART3_TX_PIN = 50
 UART3_RX_PIN = 51
 UART_BAUDRATE = 115200
+
+# ================= 网页前端代码 (新增) =================
+# 这是一个简单的 HTML 页面，包含视频流、FPS显示和保存按钮
+HTML_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>K230 AI Dashboard</title>
+    <style>
+        body { background-color: #121212; color: #ffffff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 20px; }
+        h1 { margin-bottom: 10px; color: #00ffcc; }
+        .container { display: inline-block; border: 3px solid #333; border-radius: 10px; overflow: hidden; background: #000; }
+        img { display: block; max-width: 100%; height: auto; }
+        .controls { margin-top: 20px; }
+        button { padding: 10px 20px; font-size: 16px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        button:active { background: #0056b3; }
+        .stat-box { margin-top: 15px; font-size: 18px; color: #aaa; }
+        span#fps { color: #00ff00; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>CanMV K230 AI Monitor</h1>
+    <div class="container">
+        <img src="/stream" id="stream" />
+    </div>
+    <div class="stat-box">
+        Current FPS: <span id="fps">--</span>
+    </div>
+    <div class="controls">
+        <button onclick="saveFrame()">📷 Save Screenshot</button>
+    </div>
+
+    <script>
+        // 定时获取 FPS
+        setInterval(async () => {
+            try {
+                const response = await fetch('/get_fps');
+                if (response.ok) {
+                    const text = await response.text();
+                    document.getElementById('fps').innerText = text;
+                }
+            } catch (e) { console.log("FPS fetch error"); }
+        }, 1000);
+
+        // 发送保存命令
+        async function saveFrame() {
+            try {
+                await fetch('/save_cmd');
+                alert('Command Sent: Save Frame');
+            } catch (e) { alert('Error sending command'); }
+        }
+    </script>
+</body>
+</html>
+"""
 
 # 显示模式
 display_mode="lcd"
@@ -35,7 +92,7 @@ else:
     DISPLAY_WIDTH = ALIGN_UP(1920, 16)
     DISPLAY_HEIGHT = 1080
 
-#640*480
+# 640*480
 OUT_WIDTH = ALIGN_UP(640, 8)
 OUT_HEIGHT = 480
 
@@ -69,20 +126,6 @@ current_class_name = "default"
 should_save_one = False
 current_fps = 0
 
-# HTML 页面
-HTML_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>K230 AI Stream</title>
-</head>
-<body>
-    <h2>K230 AI Stream</h2>
-    <img src="/stream" style="width:640px;"/>
-</body>
-</html>
-"""
-
 def connect_wifi():
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
@@ -93,10 +136,12 @@ def connect_wifi():
         while not wlan.isconnected():
             time.sleep(1)
             retry += 1
-            if retry > 15: return None
+            if retry > 15: 
+                print("WiFi connection timed out")
+                return None
     ip = wlan.ifconfig()[0]
-    print(f"Connected! Access address: http://{ip}")
-    return wlan.ifconfig()[0]
+    print(f"Connected! Access address: http://{ip}:{PORT}")
+    return ip
 
 def ensure_dir(path):
     try: os.stat(path)
@@ -110,20 +155,17 @@ def save_current_frame(img, class_name):
     ensure_dir(full_dir)
     file_name = f"{class_name}_{time.ticks_ms()}.jpg"
     img.save(full_dir + "/" + file_name, quality=95)
+    print(f"Saved: {full_dir}/{file_name}")
 
 def read_deploy_config(config_path):
     with open(config_path, 'r') as json_file:
         return ujson.load(json_file)
 
-# [新增] 串口发送协议包函数
 def send_uart_packet(uart, has_obj, class_id, cx, cy, area):
-    # 如果串口根本没初始化成功，直接退出，不要尝试发送
-    if uart is None:
-        return
-
     """
     协议: 帧头(0xAA 0x55) + 是否有物体(1B) + 类别(1B) + CX(2B) + CY(2B) + 面积(4B) + 帧尾(0xED)
     """
+    if uart is None: return
     try:
         packet = ustruct.pack(">BBBBHHIB", 0xAA, 0x55, has_obj, class_id, cx, cy, area, 0xED)
         uart.write(packet)
@@ -136,20 +178,24 @@ def detection():
     # ================= 1. 初始化串口 3 =================
     try:
         fpioa = FPIOA()
-        fpioa.set_function(50, FPIOA.UART3_TXD)
-        fpioa.set_function(51, FPIOA.UART3_RXD)
-        # 初始化UART3，波特率115200，8位数据位，无校验，1位停止位
-        uart3 = UART(UART.UART3, baudrate=115200, bits=UART.EIGHTBITS, parity=UART.PARITY_NONE, stop=UART.STOPBITS_ONE)
-
-       
-        print(">>> UART3 Initialized Success <<<")
+        fpioa.set_function(UART3_TX_PIN, FPIOA.UART3_TXD)
+        fpioa.set_function(UART3_RX_PIN, FPIOA.UART3_RXD)
         
+        uart3 = UART(UART.UART3, baudrate=UART_BAUDRATE, bits=UART.EIGHTBITS, parity=UART.PARITY_NONE, stop=UART.STOPBITS_ONE)
+        print(">>> UART3 Initialized Success <<<")
     except Exception as e:
-        print(f"\n!!!!!!!!!!!!\nUART3 INIT ERROR: {e}\n请检查引脚是否被占用或拼写错误\n!!!!!!!!!!!!\n")
+        print(f"UART3 INIT ERROR: {e}")
+        uart3 = None
 
+    # ================= 2. 连接 WiFi =================
     ip = connect_wifi()
-    if not ip: print("WiFi Fail")
+    if not ip: 
+        print("WiFi Fail")
+        ip_display_text = "WiFi Disconnected"
+    else:
+        ip_display_text = f"http://{ip}:{PORT}"
     
+    # Socket 初始化
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(('0.0.0.0', PORT))
@@ -159,6 +205,7 @@ def detection():
     MP_HEADER = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
     BOUNDARY = "\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n"
 
+    # ================= 3. AI 模型加载 =================
     print("det_infer start")
     deploy_conf=read_deploy_config(config_path)
     kmodel_name=deploy_conf["kmodel_path"]
@@ -177,7 +224,7 @@ def detection():
     frame_size = [OUT_WIDTH,OUT_HEIGHT]
     strides = [8,16,32]
 
-    # Padding
+    # Padding 计算
     ori_w = OUT_WIDTH; ori_h = OUT_HEIGHT;
     width = kmodel_frame_size[0]; height = kmodel_frame_size[1];
     ratiow = float(width) / ori_w; ratioh = float(height) / ori_h;
@@ -196,6 +243,7 @@ def detection():
     ai2d.set_resize_param(True, nn.interp_method.tf_bilinear, nn.interp_mode.half_pixel )
     ai2d_builder = ai2d.build([1,3,OUT_HEIGHT,OUT_WIDTH], [1,3,height,width])
 
+    # ================= 4. 摄像头与显示初始化 =================
     sensor = Sensor()
     sensor.reset()
     sensor.set_hmirror(False); sensor.set_vflip(False)
@@ -212,6 +260,7 @@ def detection():
     if display_mode=="lcd": Display.init(Display.ST7701, to_ide=True)
     else: Display.init(Display.LT9611, to_ide=True)
 
+    # OSD 层用于画框和写字
     osd_img = image.Image(DISPLAY_WIDTH, DISPLAY_HEIGHT, image.ARGB8888)
     
     try:
@@ -229,6 +278,7 @@ def detection():
             clock.tick()
             rgb888p_img = sensor.snapshot(chn=CAM_CHN_ID_2)
             
+            # AI 推理
             if rgb888p_img.format() == image.RGBP888:
                 ai2d_input = rgb888p_img.to_numpy_ref()
                 ai2d_input_tensor = nn.from_numpy(ai2d_input)
@@ -252,35 +302,21 @@ def detection():
                 else:
                     det_boxes = aicube.anchorfreedet_post_process(results[0], results[1], results[2], kmodel_frame_size, frame_size, strides, num_classes, confidence_threshold, nms_threshold, nms_option)
                 
-                # --- LCD 屏幕画框 (OSD层) & 串口发送逻辑 ---
+                # --- LCD 屏幕绘制 (OSD层) ---
                 osd_img.clear()
               
-                # 如果检测到物体
                 if det_boxes:
                     for det_boxe in det_boxes:
-                        # 1. 原始坐标
                         x1_raw, y1_raw, x2_raw, y2_raw = int(det_boxe[2]), int(det_boxe[3]), int(det_boxe[4]), int(det_boxe[5])
-                        
-                        # 2. 计算中心点和面积
                         cx_raw = int((x1_raw + x2_raw) / 2)
                         cy_raw = int((y1_raw + y2_raw) / 2)
                         area_raw = int((x2_raw - x1_raw) * (y2_raw - y1_raw))
                         
-                        # =======================================================
-                        # [保留] 原有的 IDE 终端打印
-                        # =======================================================
-                        print(f"类别: {labels[det_boxe[0]]}, 中心: ({cx_raw}, {cy_raw}), 面积: {area_raw}")
-                        # =======================================================
-                      
-                        # =======================================================
-                        # [新增] 串口3发送数据给树莓派
-                        # =======================================================
+                        # 串口发送 (识别到物体)
                         if uart3:
-                            # 1=识别到, 类别ID, CX, CY, 面积
                             send_uart_packet(uart3, 1, int(det_boxe[0]), cx_raw, cy_raw, area_raw)
-                        # =======================================================
 
-                        # 3. 转换到显示坐标 (LCD)
+                        # 屏幕画框转换
                         x_disp = int(x1_raw * DISPLAY_WIDTH // OUT_WIDTH)
                         y_disp = int(y1_raw * DISPLAY_HEIGHT // OUT_HEIGHT)
                         w_disp = int(float(x2_raw - x1_raw) * DISPLAY_WIDTH // OUT_WIDTH)
@@ -289,21 +325,24 @@ def detection():
                         osd_img.draw_rectangle(x_disp, y_disp, w_disp, h_disp, color=color_four[det_boxe[0]][1:])
                         label_str = labels[det_boxe[0]] + " " + str(round(det_boxe[1],2))
                         osd_img.draw_string_advanced(x_disp, y_disp-30, 32, label_str, color=color_four[det_boxe[0]][1:])
+                        
                         cx_disp = int(x_disp + w_disp // 2)
                         cy_disp = int(y_disp + h_disp // 2)
                         osd_img.draw_cross(cx_disp, cy_disp, size=10, color=(0, 255, 0))
                 
-                # 如果没检测到物体，也发一个空包保持心跳（可选）
                 else:
+                    # 串口发送 (未识别，心跳包)
                     if uart3:
-                        # 0=未识别, 其他全0
                         send_uart_packet(uart3, 0, 0, 0, 0, 0)
 
                 current_fps = clock.fps()
+                
+                # 绘制 OSD
                 osd_img.draw_string_advanced(10, 10, 32, f"FPS: {current_fps:.1f}", color=(255, 0, 0))
+                osd_img.draw_string_advanced(10, 50, 32, f"IP: {ip_display_text}", color=(0, 0, 255))
                 Display.show_image(osd_img, 0, 0, Display.LAYER_OSD3)
 
-                # 推流部分 (保持不变)
+                # --- 视频流推流 ---
                 if stream_client or should_save_one:
                     stream_img = sensor.snapshot(chn=CAM_CHN_ID_1)
                     if det_boxes:
@@ -311,33 +350,60 @@ def detection():
                             x1, y1, x2, y2 = int(det_boxe[2]), int(det_boxe[3]), int(det_boxe[4]), int(det_boxe[5])
                             w, h = x2-x1, y2-y1
                             stream_img.draw_rectangle(x1, y1, w, h, color=color_four[det_boxe[0]][1:], thickness=2)
+                    
                     if stream_client:
                         try:
                             stream_client.send(BOUNDARY.encode())
                             stream_client.send(stream_img.compress(quality=50))
                         except:
                             stream_client.close(); stream_client = None
+                    
                     if should_save_one:
                         save_current_frame(stream_img, current_class_name)
                         should_save_one = False
+                    
                     stream_img = None
 
-                # Socket 接收 (保持不变)
+                # ================= 核心修改：Socket 监听 =================
                 try:
                     conn, addr = s.accept()
                     conn.settimeout(0.1)
-                    req = conn.recv(1024).decode()
-                    if "GET /stream" in req:
-                        if stream_client: stream_client.close()
-                        stream_client = conn
-                        stream_client.send(MP_HEADER.encode())
-                    elif "GET /get_fps" in req:
-                        conn.send(f"HTTP/1.1 200 OK\r\n\r\n{current_fps:.1f}".encode()); conn.close()
-                    elif "GET /save_cmd" in req:
-                        should_save_one = True
-                        conn.send("HTTP/1.1 200 OK\r\n\r\nOK".encode()); conn.close()
-                    else: conn.close()
-                except: pass
+                    req_bytes = conn.recv(1024)
+                    if req_bytes:
+                        req = req_bytes.decode()
+                        line1 = req.splitlines()[0] # 获取请求第一行
+                        
+                        # 1. 响应视频流
+                        if "GET /stream" in line1:
+                            if stream_client: stream_client.close()
+                            stream_client = conn
+                            stream_client.send(MP_HEADER.encode())
+
+                        # 2. 响应首页 (修复了无法打开网页的问题)
+                        # 注意: "GET / " 中的空格很重要，防止匹配到其他路径
+                        elif "GET / " in line1:
+                            conn.send("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n".encode())
+                            conn.send(HTML_PAGE.encode())
+                            conn.close()
+
+                        # 3. 响应 FPS 查询 (JS调用)
+                        elif "GET /get_fps" in line1:
+                            conn.send(f"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n\r\n{current_fps:.1f}".encode())
+                            conn.close()
+
+                        # 4. 响应保存命令
+                        elif "GET /save_cmd" in line1:
+                            should_save_one = True
+                            conn.send("HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n\r\nOK".encode())
+                            conn.close()
+                            
+                        else:
+                            conn.close()
+                    else:
+                        conn.close()
+                except OSError:
+                    pass 
+                # ======================================================
 
             rgb888p_img = None
             gc.collect()
@@ -346,7 +412,7 @@ def detection():
         print(f"Main Loop Error: {e}")
     finally:
         os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
-        if 'uart3' in locals() and uart3: uart3.deinit() # 关闭串口
+        if 'uart3' in locals() and uart3: uart3.deinit()
         sensor.stop()
         Display.deinit()
         MediaManager.deinit()
